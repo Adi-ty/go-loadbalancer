@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -14,8 +15,10 @@ type LoadBalancer interface {
 }
 
 type WeightedLeastConnection struct {
-    servers []*Server
-    mu      sync.RWMutex
+    servers       []*Server
+    mu            sync.RWMutex
+    totalRequests uint64
+    mu2           sync.Mutex // For totalRequests
 }
 
 func NewWeightedLeastConnection(servers []*Server) *WeightedLeastConnection {
@@ -35,7 +38,6 @@ func (wlc *WeightedLeastConnection) NextServer() *Server {
     var bestServer *Server
     bestRatio := 1e18
 
-    // Find server with lowest ratio without modifying the slice
     for _, server := range wlc.servers {
         ratio := server.Ratio()
         if ratio < bestRatio {
@@ -51,7 +53,6 @@ func (wlc *WeightedLeastConnection) StartHealthChecks(ctx context.Context) {
     ticker := time.NewTicker(10 * time.Second)
     defer ticker.Stop()
 
-    // Initial health check
     wlc.performHealthChecks()
 
     for {
@@ -80,18 +81,31 @@ func (wlc *WeightedLeastConnection) performHealthChecks() {
 
         if wasHealthy != isHealthy {
             if isHealthy {
-                log.Printf("[HEALTH] ✅ Server %s is now HEALTHY", server.URL.Host)
+                log.Printf("[HEALTH] ✅ Server %s is now HEALTHY (failures: %d)", 
+                    server.URL.Host, server.FailureCount.Load())
             } else {
-                log.Printf("[HEALTH] ❌ Server %s is now UNHEALTHY: %v", server.URL.Host, err)
+                log.Printf("[HEALTH] ❌ Server %s is now UNHEALTHY: %v (failures: %d)", 
+                    server.URL.Host, err, server.FailureCount.Load())
             }
         }
     }
 }
 
 func (wlc *WeightedLeastConnection) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    if r.URL.Path == "/health" || r.URL.Path == "/healthz" {
+        wlc.handleHealthEndpoint(w, r)
+        return
+    }
+
+    if r.URL.Path == "/metrics" {
+        wlc.handleMetricsEndpoint(w, r)
+        return
+    }
+
     server := wlc.NextServer()
 
     if server == nil || !server.IsHealthy.Load() {
+        log.Printf("[ERROR] No healthy backend available for request %s %s", r.Method, r.URL.Path)
         http.Error(w, "Service Unavailable: No healthy backend servers available.", http.StatusServiceUnavailable)
         return
     }
@@ -99,13 +113,69 @@ func (wlc *WeightedLeastConnection) ServeHTTP(w http.ResponseWriter, r *http.Req
     server.ActiveConnections.Add(1)
     server.RequestCount.Add(1)
     
-    log.Printf("[WLC] Forwarding to %s (Active: %d, Total: %d, Ratio: %.2f)",
-        server.URL.Host, 
-        server.ActiveConnections.Load(), 
+    wlc.mu2.Lock()
+    wlc.totalRequests++
+    wlc.mu2.Unlock()
+
+    log.Printf("[WLC] Forwarding %s %s to %s (Active: %d, Total: %d, Ratio: %.2f)",
+        r.Method,
+        r.URL.Path,
+        server.URL.Host,
+        server.ActiveConnections.Load(),
         server.RequestCount.Load(),
         server.Ratio())
 
     defer server.ActiveConnections.Add(-1)
 
     server.ReverseProxy.ServeHTTP(w, r)
+}
+
+func (wlc *WeightedLeastConnection) handleHealthEndpoint(w http.ResponseWriter, r *http.Request) {
+    wlc.mu.RLock()
+    defer wlc.mu.RUnlock()
+
+    healthyCount := 0
+    for _, server := range wlc.servers {
+        if server.IsHealthy.Load() {
+            healthyCount++
+        }
+    }
+
+    if healthyCount == 0 {
+        w.WriteHeader(http.StatusServiceUnavailable)
+        w.Write([]byte("UNHEALTHY: No healthy backends"))
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("OK"))
+}
+
+func (wlc *WeightedLeastConnection) handleMetricsEndpoint(w http.ResponseWriter, r *http.Request) {
+    wlc.mu.RLock()
+    defer wlc.mu.RUnlock()
+
+    w.Header().Set("Content-Type", "text/plain")
+    w.WriteHeader(http.StatusOK)
+
+    wlc.mu2.Lock()
+    totalReqs := wlc.totalRequests
+    wlc.mu2.Unlock()
+
+    w.Write([]byte("# Load Balancer Metrics\n\n"))
+    w.Write([]byte("## Overall\n"))
+    fmt.Fprintf(w, "Total Requests: %d\n", totalReqs)
+    fmt.Fprintf(w, "Backend Servers: %d\n\n", len(wlc.servers))
+
+    w.Write([]byte("## Backend Servers\n"))
+    for i, server := range wlc.servers {
+        fmt.Fprintf(w, "[%d] %s\n", i+1, server.URL.Host)
+        fmt.Fprintf(w, "  Status: %s\n", map[bool]string{true: "HEALTHY", false: "UNHEALTHY"}[server.IsHealthy.Load()])
+        fmt.Fprintf(w, "  Weight: %d\n", server.Weight)
+        fmt.Fprintf(w, "  Active Connections: %d\n", server.ActiveConnections.Load())
+        fmt.Fprintf(w, "  Total Requests: %d\n", server.RequestCount.Load())
+        fmt.Fprintf(w, "  Failure Count: %d\n", server.FailureCount.Load())
+        fmt.Fprintf(w, "  Last Check: %s\n", time.Unix(server.LastCheckTime.Load(), 0).Format(time.RFC3339))
+        fmt.Fprintf(w, "  Ratio: %.2f\n\n", server.Ratio())
+    }
 }
